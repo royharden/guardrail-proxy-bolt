@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { supabase, type EventRow, type ProxyKey } from '@/lib/supabase';
+import { callAdmin, supabase, type EventRow, type ProxyKey, type UsageResponse } from '@/lib/supabase';
 import { fetchActivePolicy, refreshEvents } from '@/lib/data';
 import { DEFAULT_POLICY, type PolicyConfig } from '@/lib/policy';
 import { Hero, QuickStart, TrafficTable, UsageBanner, StatPills } from '@/components/Dashboard';
@@ -22,19 +22,18 @@ export default function App() {
   const reload = useCallback(async () => {
     const [evts, keyRows, usageRes] = await Promise.all([
       refreshEvents(60),
-      supabase.from('proxy_keys').select('id, name, mode, revoked, created_at').order('created_at', { ascending: false }).returns<ProxyKey[]>(),
-      supabase.from('usage_counters').select('fn, calls').eq('day', new Date().toISOString().slice(0, 10)),
+      supabase.from('proxy_keys_public').select('id, name, mode, revoked, created_at').order('created_at', { ascending: false }).returns<ProxyKey[]>(),
+      // usage_counters is not readable by the browser; the admin function reports it.
+      callAdmin<UsageResponse>('usage', {}, { background: true }).catch(() => null),
     ]);
     setEvents(evts);
     setKeys(keyRows.data ?? []);
     const usage: Record<string, number> = {};
-    let total = 0;
-    for (const row of (usageRes.data ?? []) as { fn: string; calls: number }[]) {
-      total += row.calls;
+    for (const row of usageRes?.counters ?? []) {
       if (row.fn.startsWith('key:')) usage[row.fn.slice(4)] = row.calls;
     }
     setKeyUsage(usage);
-    setLimitReached(total >= 200);
+    setLimitReached(usageRes ? usageRes.calls >= usageRes.limit : false);
   }, []);
 
   useEffect(() => {

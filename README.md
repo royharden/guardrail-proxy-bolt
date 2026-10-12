@@ -41,9 +41,13 @@ sequenceDiagram
 
 ### curl
 
+Every function runs with `verify_jwt = true`, so requests must carry the project's public anon key as `Authorization: Bearer` (plus `apikey`). Your `gp_` proxy key goes in the `x-proxy-key` header.
+
 ```bash
 curl https://<project-ref>.supabase.co/functions/v1/proxy/v1/chat/completions \
-  -H "Authorization: Bearer gp_<your key>" \
+  -H "Authorization: Bearer <supabase-anon-key>" \
+  -H "apikey: <supabase-anon-key>" \
+  -H "x-proxy-key: gp_<your key>" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4o-mini",
@@ -72,7 +76,8 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   baseURL: "https://<project-ref>.supabase.co/functions/v1/proxy",
-  apiKey: "gp_<your key>", // NOT your OpenAI key
+  apiKey: "<supabase-anon-key>", // public anon key, NOT your OpenAI key
+  defaultHeaders: { "x-proxy-key": "gp_<your key>" },
 });
 
 const res = await client.chat.completions.create({
@@ -84,14 +89,18 @@ console.log(res.choices[0].message.content);
 
 Blocked responses keep the OpenAI shape — the assistant content is a policy message and `guardrail.fired_rules` explains why, so existing clients never break.
 
+The upstream base URL, model and key always come from the function's env. The proxy forwards only the first system message and the last user message (redacted if needed), drops every other request field (including `model` and `temperature`), and clamps `max_tokens` to 1024. Requests over 256 KB get `413`; more than 50 messages or more than 8,000 characters in a message gets `422`.
+
 ## Setup
 
 1. Create a Supabase project (this repo ships with the schema applied).
 2. Set the secrets:
 
    ```bash
-   supabase secrets set TYPESAFE_API_KEY=... OPENAI_API_KEY=...
+   supabase secrets set ADMIN_TOKEN=<long random string> TYPESAFE_API_KEY=... OPENAI_API_KEY=...
    ```
+
+   `ADMIN_TOKEN` is required for every dashboard action (create/revoke keys, review, replay, policies, usage). The dashboard asks for it once and keeps it in `sessionStorage` for the tab. Without `TYPESAFE_API_KEY`, screening fails closed (events are flagged for review) and no Jev call is made.
 
    Without `OPENAI_API_KEY`, or for keys created in **Mock upstream** mode, the proxy returns canned replies (some deliberately leak a fake API key so output screening can be demoed). Jev still runs live in mock mode.
 
@@ -108,7 +117,8 @@ Blocked responses keep the OpenAI shape — the assistant content is a policy me
 | `OPENAI_API_KEY` | edge function secret | Upstream LLM key (never sent to the browser) |
 | `OPENAI_BASE_URL` | edge function secret | Defaults to `https://api.openai.com/v1` |
 | `OPENAI_MODEL` | edge function secret | Defaults to `gpt-4o-mini` |
-| `DAILY_CALL_LIMIT` | edge function secret | Daily demo cap, defaults to 200 |
+| `DAILY_CALL_LIMIT` | edge function secret | Daily cap on paid upstream calls (Jev + OpenAI) and on `screen` requests, defaults to 200 |
+| `ADMIN_TOKEN` | edge function secret | Required in the `x-admin-token` header for every `admin` action |
 
 Example frontend env (`.env.example`):
 
@@ -125,11 +135,11 @@ VITE_SUPABASE_ANON_KEY=...
 
 ## Threat model and limits
 
-- **This is a demo.** Single shared workspace, no auth, permissive anon RLS on the dashboard tables. Do not point production traffic at it.
+- **This is a demo.** Single shared workspace with no user accounts. The browser can read `events` and `policies` (and a `key_hash`-free `proxy_keys_public` view) with the anon key; every write goes through an Edge Function using the service role, and admin actions need `ADMIN_TOKEN`. Anyone with the anon key can read logged prompts. Do not point production traffic at it.
 - **Regex redaction is best-effort.** It catches emails, phone numbers, SSNs, Luhn-valid card numbers, and common API-key shapes (`sk-…`, `ghp_…`, `AKIA…`). It will miss PII in unusual formats, other locales, or obfuscated text. Jev decides *whether* PII is present; the regexes decide *where* — both are fallible.
-- **Daily caps.** 200 screening calls per day across `proxy` and `screen` (overridable via `DAILY_CALL_LIMIT`), 50 requests per proxy key per day. At the cap the dashboard shows a banner and the Playground switches to Replay demo mode over stored events.
+- **Daily caps.** 200 paid upstream calls per day across `proxy`, `screen` and review approvals (every Jev / OpenAI fetch counts, retries included; overridable via `DAILY_CALL_LIMIT`), 200 `screen` requests per day, and 50 requests per proxy key per day. Counters are incremented atomically by a `SECURITY DEFINER` SQL function only the service role can execute; if the counter can't be read the request is refused (`503`), and over the cap it gets `429 {"error":"daily_limit"}`. At the cap the dashboard shows a banner and the Playground switches to Replay demo mode over stored events.
 - **Screening coverage.** Jev sees the last user message plus the system prompt — not full conversation history — and the regexes only scan the texts passed to them.
-- **Key handling.** Only SHA-256 hashes of `gp_` keys are stored; plaintext is shown once at creation. `key_hash` is never readable by the browser client.
+- **Key handling.** Only SHA-256 hashes of `gp_` keys are stored; plaintext is shown once at creation. The browser has no access to the `proxy_keys` table; it reads the `proxy_keys_public` view, which has no `key_hash` column.
 
 ## Design decisions
 
@@ -138,4 +148,4 @@ VITE_SUPABASE_ANON_KEY=...
 - **Precedence: block > flag > redact > pass.** Deterministic, documented, unit-testable.
 - **Fail closed** on screener outage: flag for human review, never pass unguarded.
 - **Mock upstream by default** so the whole pipeline (including output-leak blocking) is demoable without an OpenAI key; Jev still runs live.
-- **Permissive RLS for the demo** with one hard exception: `proxy_keys.key_hash` is revoked from all client roles.
+- **Read-only RLS for the browser.** Clients may only `SELECT` from `events` and `policies`; `usage_counters` and `proxy_keys` are fully revoked from client roles.

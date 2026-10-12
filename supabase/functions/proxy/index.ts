@@ -1,13 +1,14 @@
 // proxy — OpenAI-compatible endpoint with Jev screening on input and output.
+// The Supabase gateway verifies the anon JWT (verify_jwt = true); the gp_ proxy key rides in x-proxy-key.
 import { buildJevRequest, callJev, extractAnswers } from '../_shared/jev.ts';
-import { decide, DEFAULT_POLICY, noulValue, isScore, isChoice, type PolicyConfig, type InputAnswers, type OutputAnswers, type JevAnswer } from '../_shared/decide.ts';
+import { decide, DEFAULT_POLICY, sanitizePolicy, type PolicyConfig, type InputAnswers, type OutputAnswers } from '../_shared/decide.ts';
 import { redact } from '../_shared/redact.ts';
-import { checkAndIncrementUsage, corsHeaders, getDailyLimit, json, sha256Hex, supabaseAdmin } from '../_shared/db.ts';
-
-const OPENAI_BASE_URL = Deno.env.get('OPENAI_BASE_URL') ?? 'https://api.openai.com/v1';
-const OPENAI_MODEL = Deno.env.get('OPENAI_MODEL') ?? 'gpt-4o-mini';
-
-type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string };
+import {
+  capFailure, consumeQuota, corsHeaders, json, LIMITS, PER_KEY_DAILY_LIMIT, PROXY_KEY_RE, readJsonBody,
+  serviceUnavailable, sha256Hex, supabaseAdmin, upstreamQuota,
+} from '../_shared/db.ts';
+import { callOpenAIChat, MAX_UPSTREAM_TOKENS, upstreamConfig } from '../_shared/openai.ts';
+import type { SupabaseClient } from 'npm:@supabase/supabase-js@2.57.4';
 
 function openAiResponse(model: string, content: string, extra: Record<string, unknown>, status = 200) {
   return json({
@@ -21,14 +22,47 @@ function openAiResponse(model: string, content: string, extra: Record<string, un
   }, status);
 }
 
-async function activePolicy(): Promise<PolicyConfig> {
-  const sb = supabaseAdmin();
+async function activePolicy(sb: SupabaseClient): Promise<PolicyConfig> {
   const { data } = await sb.from('policies').select('config').eq('active', true).maybeSingle();
-  return { ...DEFAULT_POLICY, ...((data?.config as Partial<PolicyConfig>) ?? {}) };
+  return { ...DEFAULT_POLICY, ...sanitizePolicy(data?.config) };
 }
 
 function policyMessage(text: string): string {
   return `Your request was blocked by Guardrail Proxy. Reason: ${text}`;
+}
+
+type ParsedMessages = { ok: true; systemPrompt: string; userMessage: string } | { ok: false; response: Response };
+
+// Validates count and size before any paid call. Only the first system message and the
+// last user message are used (and forwarded); both must be strings.
+function parseMessages(raw: unknown): ParsedMessages {
+  const reject = (status: number, error: string): ParsedMessages => ({ ok: false, response: json({ error }, status) });
+  if (!Array.isArray(raw) || raw.length === 0) return reject(400, 'messages must be a non-empty array');
+  if (raw.length > LIMITS.maxMessages) return reject(422, `too many messages (max ${LIMITS.maxMessages})`);
+
+  let systemPrompt: string | null = null;
+  let userMessage: string | null = null;
+  for (const m of raw) {
+    if (!m || typeof m !== 'object') return reject(400, 'each message must be an object');
+    const { role, content } = m as { role?: unknown; content?: unknown };
+    if (typeof content === 'string' && content.length > LIMITS.maxMessageChars) {
+      return reject(422, `message content is limited to ${LIMITS.maxMessageChars} characters`);
+    }
+    if (role === 'system' && systemPrompt === null) {
+      if (typeof content !== 'string') return reject(422, 'system message content must be a string');
+      systemPrompt = content;
+    }
+    if (role === 'user') {
+      if (typeof content !== 'string') return reject(422, 'user message content must be a string');
+      userMessage = content;
+    }
+  }
+  if (userMessage === null) return reject(400, 'messages must include a user message');
+  return { ok: true, systemPrompt: systemPrompt ?? '', userMessage };
+}
+
+function clampMaxTokens(v: unknown): number {
+  return typeof v === 'number' && Number.isInteger(v) && v > 0 ? Math.min(v, MAX_UPSTREAM_TOKENS) : MAX_UPSTREAM_TOKENS;
 }
 
 Deno.serve(async (req: Request) => {
@@ -36,41 +70,43 @@ Deno.serve(async (req: Request) => {
   try {
     if (req.method !== 'POST') return json({ error: 'POST only' }, 405);
 
-    // Auth: Bearer gp_...
-    const auth = req.headers.get('Authorization') ?? '';
-    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    if (!token.startsWith('gp_')) return json({ error: 'Invalid proxy key' }, 401);
+    const token = (req.headers.get('x-proxy-key') ?? '').trim();
+    if (!PROXY_KEY_RE.test(token)) return json({ error: 'Invalid proxy key' }, 401);
 
     const sb = supabaseAdmin();
+    if (!sb) return serviceUnavailable();
+
     const keyHash = await sha256Hex(token);
-    const { data: key } = await sb.from('proxy_keys').select('id, name, mode, revoked').eq('key_hash', keyHash).maybeSingle();
+    const { data: key, error: keyErr } = await sb.from('proxy_keys').select('id, mode, revoked').eq('key_hash', keyHash).maybeSingle();
+    if (keyErr) {
+      console.error('proxy key lookup failed:', keyErr.message);
+      return serviceUnavailable();
+    }
     if (!key || key.revoked) return json({ error: 'Unknown or revoked proxy key' }, 401);
 
-    // Per-key daily cap of 50 requests.
-    const keyUsage = await checkAndIncrementUsage(`key:${key.id}`, 50);
-    if (!keyUsage.allowed) return json({ error: 'Daily demo limit reached (per-key cap of 50)' }, 429);
+    const parsed = await readJsonBody(req, LIMITS.proxyBodyBytes);
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.body;
+    const msgs = parseMessages(body.messages);
+    if (!msgs.ok) return msgs.response;
+    const { systemPrompt, userMessage } = msgs;
 
-    // Global demo cap.
-    const limit = await getDailyLimit();
-    const usage = await checkAndIncrementUsage('proxy', limit);
-    if (!usage.allowed) return json({ error: 'Daily demo limit reached' }, 429);
+    // Per-key daily cap of 50 requests (atomic, fails closed).
+    const keyUsage = await consumeQuota(sb, `key:${key.id}`, PER_KEY_DAILY_LIMIT);
+    if (!keyUsage.ok) return capFailure(keyUsage.reason);
 
-    const body = await req.json();
-    const messages: ChatMessage[] = Array.isArray(body.messages) ? body.messages : [];
-    const lastUser = [...messages].reverse().find((m) => m.role === 'user');
-    if (!lastUser) return json({ error: 'messages must include a user message' }, 400);
-    const systemPrompt = messages.find((m) => m.role === 'system')?.content ?? '';
-    // temperature is stripped before anything is forwarded upstream.
-    const { temperature: _stripped, ...forwardBody } = body;
-
-    const policy = await activePolicy();
+    // Global daily cap: counted right before every paid Jev / OpenAI fetch.
+    const quota = upstreamQuota(sb);
+    const upstream = upstreamConfig();
+    const policy = await activePolicy(sb);
     const jevKey = Deno.env.get('TYPESAFE_API_KEY') ?? '';
 
     // ---- Input screening ----
-    const inputReq = buildJevRequest('input', systemPrompt, lastUser.content);
-    const inputRes = await callJev(inputReq, jevKey);
+    const inputReq = buildJevRequest('input', systemPrompt, userMessage);
+    const inputRes = await callJev(inputReq, jevKey, quota);
+    if (inputRes.capped) return capFailure(inputRes.capped);
     const inputAnswers = extractAnswers(inputRes.response) as unknown as InputAnswers;
-    const { redacted: inputRedacted, matches: inputMatches } = redact(lastUser.content);
+    const { redacted: inputRedacted, matches: inputMatches } = redact(userMessage);
 
     const inputDecide = inputRes.ok
       ? decide('input', inputAnswers, policy, inputMatches.length > 0)
@@ -79,7 +115,7 @@ Deno.serve(async (req: Request) => {
     const { data: inputEvent } = await sb.from('events').insert({
       key_id: key.id,
       stage: 'input',
-      original_text: lastUser.content,
+      original_text: userMessage,
       redacted_text: inputRedacted,
       jev_request: inputReq,
       jev_response: inputRes.raw as object,
@@ -102,44 +138,39 @@ Deno.serve(async (req: Request) => {
     // Blocked input: OpenAI-shaped policy response, no upstream call.
     if (inputDecide.decision === 'block') {
       const why = inputDecide.fired_rules.filter((r) => r.severity === 'block').map((r) => r.detail).join('; ');
-      return openAiResponse(String(body.model ?? OPENAI_MODEL), policyMessage(why), {
+      return openAiResponse(upstream.model, policyMessage(why), {
         guardrail: { ...inputGuardrail, output_decision: 'blocked' },
       });
     }
 
-    const messageToSend = inputDecide.decision === 'redact' ? inputRedacted : lastUser.content;
+    const messageToSend = inputDecide.decision === 'redact' ? inputRedacted : userMessage;
 
     // ---- Upstream (live or mock) ----
-    const useMock = key.mode === 'mock' || !Deno.env.get('OPENAI_API_KEY');
+    // Only the fixed env base URL / model / key are used; temperature and every other
+    // client field are dropped, and max_tokens is clamped.
+    const useMock = key.mode === 'mock' || !upstream.apiKey;
     const upstreamStarted = Date.now();
     let assistantContent: string;
-    let upstreamModel = String(body.model ?? OPENAI_MODEL);
+    let upstreamModel = upstream.model;
 
     if (useMock) {
-      assistantContent = mockReply(lastUser.content, inputRedacted, inputDecide.decision);
+      assistantContent = mockReply(userMessage, inputRedacted, inputDecide.decision);
       upstreamModel = 'mock-upstream';
     } else {
-      const res = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${Deno.env.get('OPENAI_API_KEY')}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...forwardBody, model: body.model ?? OPENAI_MODEL, messages: [
-          ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
-          { role: 'user', content: messageToSend },
-        ] }),
-      });
-      if (!res.ok) {
-        const errText = await res.text().catch(() => '');
-        return json({ error: `Upstream LLM error ${res.status}: ${errText.slice(0, 300)}` }, 502);
-      }
-      const data = await res.json();
-      assistantContent = data?.choices?.[0]?.message?.content ?? '';
-      upstreamModel = String(data?.model ?? upstreamModel);
+      const res = await callOpenAIChat([
+        ...(systemPrompt ? [{ role: 'system' as const, content: systemPrompt }] : []),
+        { role: 'user' as const, content: messageToSend },
+      ], clampMaxTokens(body.max_tokens), quota);
+      if (!res.ok) return res.error === 'upstream_error' ? json({ error: 'upstream_error' }, 502) : capFailure(res.error);
+      assistantContent = res.content;
+      upstreamModel = res.model;
     }
     const upstreamLatency = Date.now() - upstreamStarted;
 
     // ---- Output screening ----
     const outputReq = buildJevRequest('output', systemPrompt, assistantContent);
-    const outputRes = await callJev(outputReq, jevKey);
+    const outputRes = await callJev(outputReq, jevKey, quota);
+    if (outputRes.capped) return capFailure(outputRes.capped);
     const outputAnswers = extractAnswers(outputRes.response) as unknown as OutputAnswers;
     const { matches: outputMatches } = redact(assistantContent);
 
@@ -181,7 +212,8 @@ Deno.serve(async (req: Request) => {
       event_ids: { input: inputEvent?.id ?? null, output: null },
     });
   } catch (err) {
-    return json({ error: err instanceof Error ? err.message : String(err) }, 500);
+    console.error('proxy error:', err instanceof Error ? err.stack ?? err.message : String(err));
+    return json({ error: 'internal_error' }, 500);
   }
 });
 

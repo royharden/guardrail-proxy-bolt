@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Send, Copy, Check, FlaskConical, RotateCcw } from 'lucide-react';
-import { supabase } from '@/lib/supabase';
+import { functionErrorMessage, supabase } from '@/lib/supabase';
 import { ATTACK_LIBRARY, SYSTEM_PROMPT_DEFAULT } from '@/lib/attacks';
 import { DECISION_STYLES, type Decision } from '@/lib/policy';
 
@@ -40,7 +40,7 @@ export function Playground({ onSent, limitReached }: { onSent: () => void; limit
       const { data: screenData, error: screenErr } = await supabase.functions.invoke('screen', {
         body: { stage: 'input', system_prompt: system, message },
       });
-      if (screenErr) throw new Error(screenErr.message);
+      if (screenErr) throw new Error(await functionErrorMessage(screenErr));
       const screen = screenData as ScreenResponse;
       setScreening(screen);
 
@@ -50,7 +50,7 @@ export function Playground({ onSent, limitReached }: { onSent: () => void; limit
         const { data: proxyData, error: proxyErr } = await supabase.functions.invoke('proxy/v1/chat/completions', {
           body: { model: 'gpt-4o-mini', messages: [{ role: 'system', content: system }, { role: 'user', content: message }] },
         });
-        if (proxyErr) throw new Error(proxyErr.message);
+        if (proxyErr) throw new Error(await functionErrorMessage(proxyErr));
         const proxy = proxyData as SendResult & { choices?: { message?: { content?: string } }[]; error?: string };
         if (proxy.error) throw new Error(proxy.error);
         // Output screening for what came back.

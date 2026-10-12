@@ -1,8 +1,8 @@
 [functions.proxy]
-verify_jwt = false
+verify_jwt = true
 
 [functions.screen]
-verify_jwt = false
+verify_jwt = true
 
 [functions.admin]
-verify_jwt = false
+verify_jwt = true

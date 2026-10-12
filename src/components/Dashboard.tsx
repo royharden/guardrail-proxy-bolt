@@ -1,6 +1,6 @@
 import { ShieldCheck, Clock, Coins, TerminalSquare } from 'lucide-react';
 import type { EventRow, ProxyKey } from '@/lib/supabase';
-import { PROXY_URL, callAdmin } from '@/lib/supabase';
+import { PROXY_URL, SUPABASE_ANON_KEY, callAdmin, type UsageResponse } from '@/lib/supabase';
 import { DECISION_STYLES } from '@/lib/policy';
 import { CopyButton } from '@/components/Playground';
 import { useEffect, useState } from 'react';
@@ -8,8 +8,11 @@ import { useEffect, useState } from 'react';
 export function QuickStart({ keys }: { keys: ProxyKey[] }) {
   const activeKey = keys.find((k) => !k.revoked);
   const keyPlaceholder = activeKey ? 'gp_<your key>' : 'gp_<create a key first>';
+  // The gateway checks the (public) Supabase anon key; the gp_ proxy key goes in x-proxy-key.
   const curl = `curl ${PROXY_URL} \\
-  -H "Authorization: Bearer ${keyPlaceholder}" \\
+  -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \\
+  -H "apikey: ${SUPABASE_ANON_KEY}" \\
+  -H "x-proxy-key: ${keyPlaceholder}" \\
   -H "Content-Type: application/json" \\
   -d '{
     "model": "gpt-4o-mini",
@@ -19,7 +22,8 @@ export function QuickStart({ keys }: { keys: ProxyKey[] }) {
 
 const client = new OpenAI({
   baseURL: "${PROXY_URL.replace(/\/v1\/chat\/completions$/, '')}",
-  apiKey: "${keyPlaceholder}",
+  apiKey: "${SUPABASE_ANON_KEY}", // Supabase anon key (public)
+  defaultHeaders: { "x-proxy-key": "${keyPlaceholder}" },
 });
 
 const res = await client.chat.completions.create({
@@ -141,10 +145,9 @@ export function UsageBanner() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await callAdmin<{ limit: number; counters: { fn: string; calls: number }[] }>('usage');
+        const res = await callAdmin<UsageResponse>('usage', {}, { background: true });
         if (cancelled) return;
-        const calls = (res.counters ?? []).reduce((a, c) => a + c.calls, 0);
-        setUsage({ limit: res.limit, calls });
+        setUsage({ limit: res.limit, calls: res.calls });
       } catch {
         /* banner is informational */
       }

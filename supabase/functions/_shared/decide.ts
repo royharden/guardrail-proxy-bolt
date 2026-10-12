@@ -89,11 +89,39 @@ export const PRESETS: Record<string, PolicyConfig> = {
   },
 };
 
-export function isScore(a: JevAnswer): a is Score {
-  return typeof (a as Score).score === 'number';
+const POLICY_RANGES: Record<Exclude<keyof PolicyConfig, 'intentUncertainFlag'>, [number, number]> = {
+  injectionBlock: [0, 1],
+  injectionReview: [0, 1],
+  jailbreakBlock: [0, 1],
+  jailbreakReview: [0, 1],
+  toxicityBlock: [0, 3],
+  toxicityReview: [0, 3],
+  piiRedact: [0, 1],
+  piiLeakBlock: [0, 1],
+  piiLeakReview: [0, 1],
+  offPolicyBlock: [0, 1],
+  offPolicyReview: [0, 1],
+  exfilConfidence: [0, 1],
+};
+
+// Whitelists known policy keys with in-range values; anything else is dropped.
+export function sanitizePolicy(input: unknown): Partial<PolicyConfig> {
+  const out: Partial<PolicyConfig> = {};
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return out;
+  const src = input as Record<string, unknown>;
+  for (const [key, [min, max]] of Object.entries(POLICY_RANGES)) {
+    const v = src[key];
+    if (typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max) (out as Record<string, number>)[key] = v;
+  }
+  if (typeof src.intentUncertainFlag === 'boolean') out.intentUncertainFlag = src.intentUncertainFlag;
+  return out;
 }
-export function isChoice(a: JevAnswer): a is Choice {
-  return typeof (a as Choice).choice === 'string';
+
+export function isScore(a: JevAnswer | undefined): a is Score {
+  return !!a && typeof (a as Score).score === 'number';
+}
+export function isChoice(a: JevAnswer | undefined): a is Choice {
+  return !!a && typeof (a as Choice).choice === 'string';
 }
 export function noulValue(a: JevAnswer | undefined): number {
   if (!a) return 0;
